@@ -343,21 +343,30 @@ class WakeupDispatcher:
                     delivery_lock,
                     ttl_secs=MessageBusKeys.SESSION_RUN_TTL_SECS,
                 ):
-                    if (
-                        await self._storage.get_message(
+                    # Use the public batched history API rather than
+                    # StorageBase.get_message(). RedisStorage implements this
+                    # with LRANGE pages, avoiding one Redis round trip per
+                    # historical message on the first delivery.
+                    before: str | None = None
+                    while True:
+                        messages, has_more = await self._storage.list_messages(
                             user_id,
                             session_id,
-                            input_msg.id,
+                            limit=100,
+                            before=before,
                         )
-                        is not None
-                    ):
-                        logger.info(
-                            "WakeupDispatcher: skipping duplicate message %s "
-                            "for session %s.",
-                            input_msg.id,
-                            session_id,
-                        )
-                        return
+                        if any(msg.id == input_msg.id for msg in messages):
+                            logger.info(
+                                "WakeupDispatcher: skipping duplicate "
+                                "message %s for session %s.",
+                                input_msg.id,
+                                session_id,
+                            )
+                            return
+                        if not has_more or not messages:
+                            break
+                        before = messages[0].id
+
                     await self._chat_service.run(
                         user_id=user_id,
                         session_id=session_id,
