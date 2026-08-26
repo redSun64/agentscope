@@ -454,6 +454,47 @@ class ChatModelBase:
 
         return cnt
 
+    @staticmethod
+    def _format_structured_output_validation_feedback(
+        error: jsonschema.ValidationError | PydanticValidationError,
+    ) -> str:
+        """Format concise structured-output validation feedback.
+
+        Args:
+            error (`jsonschema.ValidationError | PydanticValidationError`):
+                The schema validation error.
+
+        Returns:
+            `str`:
+                The field paths and validation expectations for the retry.
+        """
+        if isinstance(error, jsonschema.ValidationError):
+            path = ".".join(str(item) for item in error.absolute_path)
+            return (
+                f"path={path or '<root>'}; "
+                f"error={error.message}; "
+                f"expected={error.validator_value!r}"
+            )
+
+        details = [
+            {
+                "path": ".".join(str(part) for part in item["loc"])
+                or "<root>",
+                "message": item["msg"],
+                "type": item["type"],
+                **(
+                    {"context": item["ctx"]}
+                    if item.get("ctx") is not None
+                    else {}
+                ),
+            }
+            for item in error.errors(
+                include_input=False,
+                include_url=False,
+            )
+        ]
+        return json.dumps(details, ensure_ascii=False, default=str)
+
     async def generate_structured_output(
         self,
         messages: list[Msg],
@@ -462,12 +503,13 @@ class ChatModelBase:
     ) -> StructuredResponse:
         """Generate structured output, trying fallback strategies in order.
 
-        Each strategy is retried on transient (retryable) errors. A
-        :class:`~agentscope.exception.StructuredOutputError` (the model did
-        not produce a valid structured output) or a provider error listed in
+        Each strategy is retried on transient (retryable) errors. Schema
+        validation failures receive one same-strategy repair attempt with
+        concise feedback when the existing retry budget allows it. Other
+        structured-output failures, or provider errors listed in
         ``_get_structured_output_fallback_exceptions()`` (e.g. a provider
-        rejecting a forced ``tool_choice`` while thinking is enabled) moves
-        on to the next strategy; any other error is raised immediately. The
+        rejecting a forced ``tool_choice`` while thinking is enabled), move
+        on to the next strategy. Any other error is raised immediately. The
         strategies are immutable and local to each call:
 
         - ``forced``: current config + forced ``tool_choice``
@@ -520,6 +562,8 @@ class ChatModelBase:
             StructuredOutputError,
             *self._get_structured_output_fallback_exceptions(),
         )
+        validation_repaired = False
+        attempt_messages = messages
         first_error: Exception | None = None
         last_error: Exception | None = None
         for name, extra_kwargs, tool_choice in strategies:
@@ -534,7 +578,7 @@ class ChatModelBase:
                 try:
                     result = await self._call_api_with_structured_output(
                         self.model,
-                        messages=messages,
+                        messages=attempt_messages,
                         structured_model=structured_model,
                         tool_choice=tool_choice,
                         **merged,
@@ -554,6 +598,49 @@ class ChatModelBase:
                     if first_error is None:
                         first_error = e
                     last_error = e
+                    validation_error = e.__cause__
+                    if (
+                        isinstance(e, StructuredOutputError)
+                        and isinstance(
+                            validation_error,
+                            (
+                                jsonschema.ValidationError,
+                                PydanticValidationError,
+                            ),
+                        )
+                        and not validation_repaired
+                        and attempt < self.max_retries
+                    ):
+                        validation_repaired = True
+                        feedback = (
+                            self._format_structured_output_validation_feedback(
+                                validation_error,
+                            )
+                        )
+                        attempt_messages = [
+                            *messages,
+                            UserMsg(
+                                name="user",
+                                content=(
+                                    "<system-reminder>Your previous "
+                                    "structured output failed schema "
+                                    f"validation: {feedback}. Please call "
+                                    "'generate_structured_output' again and "
+                                    "strictly follow the provided schema, "
+                                    "including exact field names and types."
+                                    "</system-reminder>"
+                                ),
+                            ),
+                        ]
+                        logger.debug(
+                            "Structured output validation failed for %s; "
+                            "retrying strategy '%s' with validation "
+                            "feedback.",
+                            self.model,
+                            name,
+                        )
+                        continue
+
                     if isinstance(e, retryable):
                         # Transient error: retry the same strategy. A
                         # different strategy hits the same endpoint, so

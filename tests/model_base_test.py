@@ -3,14 +3,18 @@
 retry / accumulation / interrupt wrapper around ``_call_api``."""
 import asyncio
 import base64
+from dataclasses import asdict
 from typing import Any
 from unittest.async_case import IsolatedAsyncioTestCase
+
+import jsonschema
 
 from utils import AnyString, MockModel
 
 from agentscope.message import (
     Base64Source,
     DataBlock,
+    Msg,
     TextBlock,
     ThinkingBlock,
     ToolCallBlock,
@@ -31,6 +35,23 @@ class _BadRequestError(Exception):
     """A provider "bad request" error used to exercise strategy fallback."""
 
 
+def _validation_error() -> StructuredOutputError:
+    """Build a structured-output error caused by schema validation."""
+    schema = {
+        "type": "object",
+        "properties": {"task_overview": {"type": "string"}},
+        "required": ["task_overview"],
+    }
+    try:
+        jsonschema.validate({}, schema)
+    except jsonschema.ValidationError as validation_error:
+        error = StructuredOutputError("Invalid structured output")
+        error.__cause__ = validation_error
+        return error
+
+    raise AssertionError("The invalid test value passed schema validation.")
+
+
 class StructuredOutputStrategyMockModel(MockModel):
     """Record and control structured-output strategy attempts."""
 
@@ -44,6 +65,7 @@ class StructuredOutputStrategyMockModel(MockModel):
         self.responses = list(responses or [])
         self.reject_forced = reject_forced
         self.structured_calls: list[tuple[str | None, dict[str, Any]]] = []
+        self.structured_messages: list[list[Msg]] = []
 
     def _get_disable_thinking_kwargs(self) -> dict:
         """Expose a provider-specific thinking toggle."""
@@ -65,9 +87,10 @@ class StructuredOutputStrategyMockModel(MockModel):
         **kwargs: Any,
     ) -> StructuredResponse:
         """Return or raise the configured result for one strategy."""
-        del model_name, messages, structured_model
+        del model_name, structured_model
         mode = tool_choice.mode if tool_choice is not None else None
         self.structured_calls.append((mode, kwargs))
+        self.structured_messages.append(messages)
         await asyncio.sleep(0)
 
         if self.reject_forced and mode == "generate_structured_output":
@@ -1138,6 +1161,15 @@ class StructuredOutputStrategyTest(IsolatedAsyncioTestCase):
         """Prepare a common structured-output request."""
         self.messages = [UserMsg(name="user", content="hi")]
         self.schema = {"type": "object"}
+        self.expected_response = {
+            "content": {"task_overview": "summary"},
+            "id": AnyString(),
+            "created_at": AnyString(),
+            "type": "structured_response",
+            "usage": None,
+            "metadata": {},
+            "finished_reason": FinishedReason.COMPLETED,
+        }
 
     async def test_strategy_order(self) -> None:
         """Preserve thinking before falling back to disabling it."""
@@ -1217,6 +1249,70 @@ class StructuredOutputStrategyTest(IsolatedAsyncioTestCase):
             (
                 expected,
                 [("generate_structured_output", {})],
+            ),
+        )
+
+    async def test_validation_error_retries_with_feedback(self) -> None:
+        """Retry schema validation once on the same strategy."""
+        model = StructuredOutputStrategyMockModel(
+            responses=[
+                _validation_error(),
+                StructuredResponse(content={"task_overview": "summary"}),
+            ],
+        )
+        model.max_retries = 1
+
+        result = await model.generate_structured_output(
+            self.messages,
+            self.schema,
+        )
+
+        feedback = "".join(
+            getattr(block, "text", "")
+            for block in model.structured_messages[1][-1].get_content_blocks()
+        )
+        self.assertEqual(
+            (asdict(result), model.structured_calls, feedback),
+            (
+                self.expected_response,
+                [
+                    ("generate_structured_output", {}),
+                    ("generate_structured_output", {}),
+                ],
+                "<system-reminder>Your previous structured output failed "
+                "schema validation: path=<root>; error='task_overview' is a "
+                "required property; expected=['task_overview']. Please call "
+                "'generate_structured_output' again and strictly follow the "
+                "provided schema, including exact field names and types."
+                "</system-reminder>",
+            ),
+        )
+
+    async def test_validation_repair_then_resumes_fallback(self) -> None:
+        """Resume the existing strategy ladder after repair is exhausted."""
+        model = StructuredOutputStrategyMockModel(
+            responses=[
+                _validation_error(),
+                _validation_error(),
+                StructuredResponse(content={"task_overview": "summary"}),
+            ],
+        )
+        model.max_retries = 1
+
+        result = await model.generate_structured_output(
+            self.messages,
+            self.schema,
+        )
+
+        self.assertEqual(
+            (asdict(result), model.structured_calls),
+            (
+                self.expected_response,
+                [
+                    ("generate_structured_output", {}),
+                    ("generate_structured_output", {}),
+                    ("auto", {}),
+                ],
             ),
         )
 
